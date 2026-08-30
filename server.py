@@ -230,35 +230,48 @@ class MobileRelay(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         self.log("Connected")
 
-        if not self.recv_handshake():
-            self.log("Quit: Login failed")
-            return
-        self.send_handshake()
-        self.log("Logged in as %s" % self.user.get_number(),
-                 "(new user)" if self.user_new else "")
-
-        while True:
-            data = self.request.recv(2)
-            if len(data) < 2:
-                self.log("Quit: Disconnect")
+        try:
+            if not self.recv_handshake():
+                self.log("Quit: Login failed")
                 return
 
-            version, command = data
-            if version != PROTOCOL_VERSION:
-                self.log("Quit: Invalid command")
-                return
+            self.send_handshake()
 
-            if command == MobileRelayCommand.CALL:
-                if self.handle_call():
-                    return self.handle_relay()
-            elif command == MobileRelayCommand.WAIT:
-                if self.handle_wait():
-                    return self.handle_relay()
-            elif command == MobileRelayCommand.GET_NUMBER:
-                self.handle_get_number()
-            else:
-                self.log("Quit: Invalid command")
-                return
+            self.log(
+                "Logged in as %s" % self.user.get_number(),
+                "(new user)" if self.user_new else ""
+            )
+
+            while True:
+                data = self.request.recv(2)
+
+                if len(data) < 2:
+                    self.log("Quit: Disconnect")
+                    return
+
+                version, command = data
+
+                if version != PROTOCOL_VERSION:
+                    self.log("Quit: Invalid command")
+                    return
+
+                if command == MobileRelayCommand.CALL:
+                    if self.handle_call():
+                        return self.handle_relay()
+
+                elif command == MobileRelayCommand.WAIT:
+                    if self.handle_wait():
+                        return self.handle_relay()
+
+                elif command == MobileRelayCommand.GET_NUMBER:
+                    self.handle_get_number()
+
+                else:
+                    self.log("Quit: Invalid command")
+                    return
+
+        except (ConnectionResetError, BrokenPipeError):
+            self.log("Quit: Connection reset")
 
 
 class Server(socketserver.ThreadingTCPServer):
