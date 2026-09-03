@@ -1,0 +1,16 @@
+services:
+  mobile-relay:
+    build: .
+    container_name: mobile-relay
+    restart: "no"
+
+    ports:
+      - "31227:31227/tcp"
+
+    environment:
+      PYTHONUNBUFFERED: "1"
+
+    volumes:
+      - .:/app
+
+    command: python3 server.py
