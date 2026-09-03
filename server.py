@@ -59,8 +59,13 @@ class MobileRelay(socketserver.BaseRequestHandler):
         has_token, = self.request.recv(1)
         self.user_new = False
         if has_token == 0:
-            user = self.peers.connect()
-            self.user_new = True
+            # Live negotiation of a fresh token has been retired -- tokens
+            # are now provisioned at account signup and shipped in
+            # config.bin (or set manually, both already supported before
+            # this). A device connecting without one is on a config.bin
+            # from before that, or never configured one; reject rather
+            # than mint an anonymous, account-less token.
+            return False
         elif has_token == 1:
             token = self.request.recv(16)
             user = self.peers.connect(token)

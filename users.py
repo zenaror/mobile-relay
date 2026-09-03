@@ -43,11 +43,27 @@ class DatabaseSQLBase(threading.local):
             c.execute("""
                 CREATE TABLE IF NOT EXISTS relay_users (
                     token      BINARY(16) NOT NULL UNIQUE,
-                    number     TEXT NOT NULL UNIQUE,
+                    number     VARCHAR(12) NOT NULL UNIQUE,
                     last_seen  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    registered INT
+                    registered INT,
+                    user_id    INT NULL UNIQUE
                 )
             """)
+            # Pre-existing databases from before user_id existed: add it
+            # without disturbing rows already provisioned by live
+            # negotiation (those just stay NULL here, keyed by token only,
+            # same as always). No UNIQUE here -- SQLite's ADD COLUMN can't
+            # carry one, and uniqueness is already enforced by PHP only
+            # ever assigning a user_id once, at account creation.
+            #
+            # "ADD COLUMN IF NOT EXISTS" isn't valid syntax on real MySQL
+            # (only MariaDB accepts it) -- catch the duplicate-column error
+            # instead, which is portable across both that and SQLite.
+            try:
+                c.execute("ALTER TABLE relay_users ADD COLUMN user_id INT NULL")
+            except Exception as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
 
     def connect(self):
         if self._db is None:
