@@ -190,10 +190,14 @@ class MobilePeers:
                 self._users.update(user)
                 peer = MobilePeer(user)
                 self._connected[peer.get_number()] = peer
+                self._users.set_connected_count(len(self._connected))
             return peer
 
     def disconnect(self, user: MobilePeer) -> None:
-        peer = self._connected.pop(user.get_number())
+        with self._connected_lock:
+            peer = self._connected.pop(user.get_number())
+            with self._users:
+                self._users.set_connected_count(len(self._connected))
         peer.close()
 
     def dial(self, number: str) -> typing.Optional[MobilePeer]:

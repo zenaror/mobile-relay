@@ -4,21 +4,28 @@ import time
 import typing
 import unittest
 import socket
-from server import PROTOCOL_VERSION, handshake_magic, MobileRelayCommand, \
-    MobileRelayCallResult, MobileRelayWaitResult
+from server import PROTOCOL_VERSION, PROTOCOL_VERSION_DEVICE, \
+    handshake_word, handshake_magic, MobileRelayCommand, \
+    MobileRelayCallResult, MobileRelayWaitResult, MobileRelayHandshakeReason
 
 
 class MobileRelayClient:
     sock: typing.Optional[socket.socket]
 
-    def __init__(self, token: typing.Optional[bytes] = None):
+    def __init__(self, token: typing.Optional[bytes] = None,
+                 version: int = PROTOCOL_VERSION,
+                 device: typing.Optional[bytes] = None,
+                 port: int = 31227):
         self.sock = None
         self.token = token
+        self.version = version
+        self.device = device
+        self.port = port
         self.connect()
 
     def connect(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect(("127.0.0.1", 31227))
+        self.sock.connect(("127.0.0.1", self.port))
 
     def close(self) -> None:
         if self.sock:
@@ -26,17 +33,31 @@ class MobileRelayClient:
             self.sock = None
 
     def send_handshake(self) -> None:
-        buffer = bytearray(handshake_magic)
+        buffer = bytearray([self.version]) + handshake_word
         if self.token is not None:
             buffer.append(1)
             buffer += self.token
         else:
             buffer.append(0)
+        if self.version >= PROTOCOL_VERSION_DEVICE:
+            if self.device is not None:
+                buffer.append(1)
+                buffer += self.device
+            else:
+                buffer.append(0)
         self.sock.send(buffer)
 
+    # Only for a version 1 client the server turned away: the one reason
+    # byte it sends before closing, or None if the socket just closed.
+    def recv_refusal(self) -> typing.Optional[MobileRelayHandshakeReason]:
+        data = self.sock.recv(1)
+        if not data:
+            return None
+        return MobileRelayHandshakeReason(data[0])
+
     def recv_handshake(self) -> typing.Optional[bytes]:
-        handshake = self.sock.recv(len(handshake_magic))
-        assert handshake == handshake_magic
+        handshake = self.sock.recv(1 + len(handshake_word))
+        assert handshake == bytes([self.version]) + handshake_word
         new_token, = self.sock.recv(1)
         if new_token == 1:
             token = self.sock.recv(16)
@@ -48,24 +69,24 @@ class MobileRelayClient:
 
     def send_call(self, number: str) -> None:
         encnum = number.encode()
-        buffer = bytearray([PROTOCOL_VERSION, MobileRelayCommand.CALL])
+        buffer = bytearray([self.version, MobileRelayCommand.CALL])
         buffer.append(len(encnum))
         buffer += encnum
         self.sock.send(buffer)
 
     def recv_call(self) -> MobileRelayCallResult:
         recv = self.sock.recv(3)
-        assert recv[0] == PROTOCOL_VERSION
+        assert recv[0] == self.version
         assert recv[1] == MobileRelayCommand.CALL
         return MobileRelayCallResult(recv[2])
 
     def send_wait(self) -> None:
-        buffer = bytearray([PROTOCOL_VERSION, MobileRelayCommand.WAIT])
+        buffer = bytearray([self.version, MobileRelayCommand.WAIT])
         self.sock.send(buffer)
 
     def recv_wait(self) -> tuple[MobileRelayWaitResult, str]:
         recv = self.sock.recv(4)
-        assert recv[0] == PROTOCOL_VERSION
+        assert recv[0] == self.version
         assert recv[1] == MobileRelayCommand.WAIT
         assert recv[3] != 0
         number = self.sock.recv(recv[3])
@@ -73,12 +94,12 @@ class MobileRelayClient:
         return MobileRelayWaitResult(recv[2]), number.decode()
 
     def send_get_number(self) -> None:
-        buffer = bytearray([PROTOCOL_VERSION, MobileRelayCommand.GET_NUMBER])
+        buffer = bytearray([self.version, MobileRelayCommand.GET_NUMBER])
         self.sock.send(buffer)
 
     def recv_get_number(self) -> str:
         recv = self.sock.recv(3)
-        assert recv[0] == PROTOCOL_VERSION
+        assert recv[0] == self.version
         assert recv[1] == MobileRelayCommand.GET_NUMBER
         assert recv[2] != 0
         number = self.sock.recv(recv[2])

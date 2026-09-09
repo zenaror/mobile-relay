@@ -18,6 +18,9 @@ except ImportError as e:
 class MobileUser:
     token: bytes
     number: str
+    # REON account the token was provisioned for; None for a row minted by
+    # the retired live negotiation, which belongs to nobody.
+    user_id: typing.Optional[int] = None
 
 
 class DatabaseSQLBase(threading.local):
@@ -65,6 +68,26 @@ class DatabaseSQLBase(threading.local):
                 if "duplicate column" not in str(e).lower():
                     raise
 
+            # Small single-purpose key/value table -- currently just holds
+            # the live P2P connection count, kept in sync on every
+            # connect()/disconnect() so REON's status page can read an
+            # exact, real-time figure instead of approximating from
+            # relay_users.last_seen.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS relay_stats (
+                    name  VARCHAR(32) NOT NULL UNIQUE,
+                    value INT NOT NULL
+                )
+            """)
+
+    # Portable single-row upsert (works identically on MySQL and SQLite,
+    # unlike "ON DUPLICATE KEY UPDATE" / "INSERT OR REPLACE") -- fine here
+    # since relay_stats is tiny and write frequency is low.
+    def set_stat(self, name, value):
+        with contextlib.closing(self._db.cursor()) as c:
+            c.execute(self._format("DELETE FROM relay_stats WHERE name = ?"), (name,))
+            c.execute(self._format("INSERT INTO relay_stats(name, value) VALUES(?, ?)"), (name, value))
+
     def connect(self):
         if self._db is None:
             self._db = self._module.connect(**self._args)
@@ -92,16 +115,28 @@ class DatabaseSQLBase(threading.local):
     def lookup_token(self, token):
         with contextlib.closing(self._db.cursor()) as c:
             c.execute(self._format("""
-                SELECT token, number FROM relay_users WHERE token = ?
+                SELECT token, number, user_id FROM relay_users WHERE token = ?
             """), (token,))
             return c.fetchone()
 
     def lookup_number(self, number):
         with contextlib.closing(self._db.cursor()) as c:
             c.execute(self._format("""
-                SELECT token, number FROM relay_users WHERE number = ?
+                SELECT token, number, user_id FROM relay_users WHERE number = ?
             """), (number,))
             return c.fetchone()
+
+    # Whether REON's "connected devices" page has this device of this
+    # account blocked. Only the MySQL backend can answer (the table lives
+    # in REON's own database, next to ours on the same server); anything
+    # else has no opinion and the relay lets the device through, the same
+    # fail-open the adapters apply when the server does not answer.
+    #
+    # Read-only on purpose: the handshake that carries the device id is not
+    # signed, so it must never create rows (an account has 32 device slots)
+    # nor touch "last seen" -- only a signed device-auth query may.
+    def lookup_device_blocked(self, user_id, device_id):
+        return None
 
 
 class DatabaseMySQL(DatabaseSQLBase):
@@ -111,10 +146,30 @@ class DatabaseMySQL(DatabaseSQLBase):
 
         super().__init__()
         self._module = MySQLdb
+        # Name of REON's database, holding sys_device_counter. Optional:
+        # without it the relay never blocks a device. Popped so it does
+        # not reach MySQLdb.connect().
+        self._reon_db = kwargs.pop("reon_db", None)
         self._args = kwargs
 
     def _format(self, string):
         return string.replace("?", "%s")
+
+    def has_device_blocks(self):
+        return bool(self._reon_db)
+
+    def lookup_device_blocked(self, user_id, device_id):
+        if not self._reon_db:
+            return None
+        with contextlib.closing(self._db.cursor()) as c:
+            c.execute(self._format("""
+                SELECT blocked FROM `%s`.sys_device_counter
+                WHERE user_id = ? AND device_id = ?
+            """ % self._reon_db.replace("`", "")), (user_id, device_id))
+            row = c.fetchone()
+            if row is None:
+                return None
+            return bool(row[0])
 
 
 class DatabaseSQLite(DatabaseSQLBase):
@@ -138,6 +193,10 @@ class MobileUserDatabase:
         else:
             self._db = DatabaseSQLite(database="users.db")
         print("Database:", self._db)
+        if getattr(self._db, "has_device_blocks", lambda: False)():
+            print("Device blocks: enabled (reon_db = %s)" % self._db._reon_db)
+        else:
+            print("Device blocks: disabled (no [mysql] reon_db configured)")
 
         self._db.init()
         self._new_write_lock = threading.Lock()
@@ -188,14 +247,31 @@ class MobileUserDatabase:
         self._db.update_timestamp(user.token, user.number)
         self._db.commit()
 
+    def set_connected_count(self, count: int) -> None:
+        self._db.set_stat("connected_count", count)
+        self._db.commit()
+
     def lookup_token(self, token: bytes) -> typing.Optional[MobileUser]:
         row = self._db.lookup_token(token)
         if not row:
             return None
-        return MobileUser(row[0], row[1])
+        return MobileUser(row[0], row[1], row[2])
 
     def lookup_number(self, number: str) -> typing.Optional[MobileUser]:
         row = self._db.lookup_number(number)
         if not row:
             return None
-        return MobileUser(row[0], row[1])
+        return MobileUser(row[0], row[1], row[2])
+
+    # True only when REON has that (account, device) row and it is blocked.
+    # Unknown row, unknown device, no account, or no REON database all
+    # come back False: the relay only enforces a block it can see.
+    def device_blocked(self, user_id: typing.Optional[int],
+                       device_id: str) -> bool:
+        if user_id is None:
+            return False
+        try:
+            return self._db.lookup_device_blocked(user_id, device_id) is True
+        except Exception as e:
+            print("Device block lookup failed, letting through:", e)
+            return False
