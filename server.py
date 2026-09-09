@@ -43,9 +43,13 @@ handshake_magic = bytes([PROTOCOL_VERSION]) + handshake_word
 DEVICE_ID_NONE = ""
 DEVICE_ID_SIZE = 8
 
-# Version 0 handshakes are accepted for now (see above); flip to refuse
-# them once every adapter ships version 1.
-ACCEPT_VERSION_0 = True
+# Version 0 handshakes were accepted, and logged, while the adapters
+# shipped version 1; cut on 2026-09-09 once mGBA, libmobile-bgb and
+# PicoAdapterGB all carried it. A version 0 client now gets the bare close
+# it always got on a bad handshake. Flip back only for a deliberate
+# transition, never to accommodate one stale device: an old client is a
+# bypass of the per-device block by construction.
+ACCEPT_VERSION_0 = False
 
 
 class MobileRelayHandshakeReason(enum.IntEnum):
