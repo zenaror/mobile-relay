@@ -5,10 +5,73 @@ import typing
 import enum
 import time
 import select
+import socket
+import configparser
 import socketserver
 
 import users
 import peers
+
+
+class RelayLimits:
+    """How long a connection may do nothing before it is dropped.
+
+    Two different problems, and they need different answers.
+
+    A socket that is *dead* -- the cable pulled, the console switched off,
+    a NAT mapping expired -- sends no FIN and no RST. The kernel never
+    finds out on its own, so a blocking recv or poll on it waits forever.
+    That is what TCP keepalive is for, and it cannot cost a live player
+    anything: it only ever discovers connections that are already gone.
+
+    A socket that is *alive but idle* is a judgement call, not a fact.
+    Somebody waiting for a friend to call is idle on purpose, and a
+    timeout there ends a session a person is actually having. So those
+    are configured, default to off, and are the operator's decision.
+
+    The one exception is the handshake. A connection that has not said
+    "MOBILE" yet is not a player; on a port the open internet can reach it
+    is usually a scanner. Letting it hold a thread for as long as it likes
+    is a way to run the relay out of threads with a netcat, so this one
+    defaults to on.
+    """
+
+    def __init__(self, filename: str = ""):
+        config = configparser.ConfigParser()
+        if filename:
+            config.read(filename)
+        section = config["relay"] if "relay" in config else {}
+
+        def seconds(key: str, default: int) -> int:
+            try:
+                value = int(section.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            return value if value > 0 else 0
+
+        # On by default: cannot end a session anybody is having.
+        self.handshake = seconds("handshake_timeout", 15)
+        self.keepalive = str(section.get("keepalive", "yes")).strip().lower() \
+            not in ("0", "no", "false", "off")
+        self.keepalive_idle = seconds("keepalive_idle", 60)
+        self.keepalive_interval = seconds("keepalive_interval", 15)
+        self.keepalive_count = seconds("keepalive_count", 4)
+
+        # Off by default: each of these can end a live session, so turning
+        # one on is the operator saying they want that.
+        self.idle = seconds("idle_timeout", 0)
+        self.wait = seconds("wait_timeout", 0)
+        self.relay = seconds("relay_timeout", 0)
+
+    def describe(self) -> str:
+        def show(value: int) -> str:
+            return "%ds" % value if value else "off"
+        return ("keepalive %s (%ds/%ds x%d), handshake %s, idle %s, "
+                "wait %s, relay %s") % (
+            "on" if self.keepalive else "off",
+            self.keepalive_idle, self.keepalive_interval, self.keepalive_count,
+            show(self.handshake), show(self.idle),
+            show(self.wait), show(self.relay))
 
 # The client states its protocol version in the first byte of the handshake
 # and every command; the server answers in the same version, per
@@ -42,6 +105,12 @@ handshake_magic = bytes([PROTOCOL_VERSION]) + handshake_word
 # is absent. Blocking that row on the site then reaches these clients too.
 DEVICE_ID_NONE = ""
 DEVICE_ID_SIZE = 8
+
+# How long any wait-for-something poll blocks before looking around. It is
+# not a timeout -- it is the granularity at which one can be noticed, and
+# the reason a poll with no deadline still wakes up to see that keepalive
+# has condemned the socket underneath it.
+POLL_SLICE_MS = 1000
 
 # Version 0 handshakes were accepted, and logged, while the adapters
 # shipped version 1; cut on 2026-09-09 once mGBA, libmobile-bgb and
@@ -83,21 +152,55 @@ class MobileRelayWaitResult(enum.IntEnum):
     INTERNAL = enum.auto()
 
 
+# Replaced from config.ini at startup. Built here too so that importing this
+# module -- a test, a REPL -- cannot fail on a name that only __main__ sets.
+g_limits = RelayLimits()
+
+
 class MobileRelay(socketserver.BaseRequestHandler):
     user_new: bool
     user: typing.Optional[peers.MobilePeer]
     users: users.MobileUserDatabase
     peers: peers.MobilePeers
+    limits: RelayLimits
     version: int
     device_id: str
 
     def setup(self) -> None:
         self.users = g_users
         self.peers = g_peers
+        self.limits = g_limits
         self.user = None
         self.user_new = False
         self.version = PROTOCOL_VERSION
         self.device_id = DEVICE_ID_NONE
+
+        # Keepalive first, because everything below depends on the kernel
+        # being willing to tell us the other end is gone. Without it a
+        # console that was switched off mid-session leaves this thread in a
+        # blocking read that never returns -- and, worse, leaves the account
+        # number in the connected set, where MobilePeers.connect() refuses
+        # to let that same account log in again until the process restarts.
+        if self.limits.keepalive:
+            try:
+                sock = self.request
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                for option, value in (
+                    ("TCP_KEEPIDLE", self.limits.keepalive_idle),
+                    ("TCP_KEEPINTVL", self.limits.keepalive_interval),
+                    ("TCP_KEEPCNT", self.limits.keepalive_count),
+                ):
+                    # Not every platform names all three; the plain
+                    # SO_KEEPALIVE above still applies with system defaults.
+                    if hasattr(socket, option) and value:
+                        sock.setsockopt(socket.IPPROTO_TCP,
+                                        getattr(socket, option), value)
+            except OSError as e:
+                self.log("Keepalive unavailable:", e)
+
+        # A connection that has not identified itself yet gets a short leash.
+        if self.limits.handshake:
+            self.request.settimeout(self.limits.handshake)
 
     def finish(self) -> None:
         if self.user:
@@ -279,6 +382,12 @@ class MobileRelay(socketserver.BaseRequestHandler):
         poller.register(self.user.rpipe, select.POLLIN)
 
         # Set self into waiting state, break out when called
+        #
+        # This poll used to have no timeout of any kind, so a console that
+        # went away while waiting for a call sat here forever -- holding a
+        # thread, holding its number in the connected set, and so keeping
+        # that account from logging in again.
+        deadline = time.time() + self.limits.wait if self.limits.wait else None
         while True:
             res = self.user.wait()
             if res == 1:
@@ -287,14 +396,25 @@ class MobileRelay(socketserver.BaseRequestHandler):
                 self.send_wait(MobileRelayWaitResult.INTERNAL)
                 raise ConnectionResetError
 
-            # Wait for any event
-            events = poller.poll()
+            # Wait for any event. Poll in slices even with no deadline, so
+            # a dead socket is noticed once keepalive has condemned it
+            # rather than only when something happens to arrive.
+            events = poller.poll(POLL_SLICE_MS)
 
             # Break out if any data or error is available in the socket
             if any(fd == self.user.sock.fileno() for fd, _ in events):
                 if not self.user.wait_stop():
                     raise ConnectionResetError
                 return False
+
+            if deadline is not None and time.time() >= deadline:
+                # There is no "timed out" in MobileRelayWaitResult, and
+                # inventing one by sending INTERNAL would tell the adapter
+                # the server broke. Dropping the connection is what a kick
+                # is, and it is the truthful one: stop waiting, then close.
+                self.user.wait_stop()
+                self.log("Quit: Waited %ds without a call" % self.limits.wait)
+                raise ConnectionResetError
         self.send_wait(MobileRelayWaitResult.ACCEPTED,
                        self.user.get_pair_number())
         self.user.wait_ready()
@@ -331,8 +451,18 @@ class MobileRelay(socketserver.BaseRequestHandler):
             poller = select.poll()
             poller.register(mine, select.POLLIN | select.POLLPRI)
             poller.register(pair, select.POLLRDHUP)
+            quiet_since = time.time()
             while True:
-                events = poller.poll()
+                events = poller.poll(POLL_SLICE_MS)
+
+                if not events:
+                    if self.limits.relay and \
+                            time.time() - quiet_since >= self.limits.relay:
+                        self.log("Quit: No traffic for %ds"
+                                 % self.limits.relay)
+                        return
+                    continue
+                quiet_since = time.time()
 
                 for fd, event in events:
                     if fd == mine.fileno():
@@ -342,6 +472,11 @@ class MobileRelay(socketserver.BaseRequestHandler):
                         pair.send(data)
                     elif fd == pair.fileno() and event & select.POLLRDHUP:
                         return
+        except socket.timeout:
+            # Only reachable with an idle timeout configured, which puts the
+            # socket in timeout mode: the pair stopped draining what we send.
+            # Ending the relay is the right answer either way.
+            self.log("Quit: Peer stopped reading")
         except ConnectionResetError:
             # There's a billion normal circumstances in which a client can
             #  cause this error instead of returning an empty buffer.
@@ -360,8 +495,18 @@ class MobileRelay(socketserver.BaseRequestHandler):
         self.log("Logged in as %s" % self.user.get_number(),
                  "(new user)" if self.user_new else "")
 
+        # Past the handshake this is a player, not a scanner. The leash
+        # becomes whatever the operator configured for an idle session --
+        # by default none at all, and then the socket goes back to blocking
+        # so nothing below has to know about timeouts.
+        self.request.settimeout(self.limits.idle or None)
+
         while True:
-            data = self.request.recv(2)
+            try:
+                data = self.request.recv(2)
+            except socket.timeout:
+                self.log("Quit: Idle for %ds" % self.limits.idle)
+                return
             if len(data) < 2:
                 self.log("Quit: Disconnect")
                 return
@@ -392,6 +537,8 @@ if __name__ == "__main__":
     HOST, PORT = "", 31227
     g_users = users.MobileUserDatabase("config.ini")
     g_peers = peers.MobilePeers(g_users)
+    g_limits = RelayLimits("config.ini")
+    print("Limits:", g_limits.describe())
     with Server((HOST, PORT), MobileRelay) as server:
         try:
             server.serve_forever()
