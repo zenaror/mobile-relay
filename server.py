@@ -121,6 +121,17 @@ POLL_SLICE_MS = 1000
 ACCEPT_VERSION_0 = False
 
 
+class RelayKicked(Exception):
+    """Ended by the server, deliberately, because a limit was reached.
+
+    Raised instead of ConnectionResetError so it can be caught and logged as
+    one line. Letting a timeout escape as an unhandled exception drops the
+    connection just as well, but socketserver answers it with a traceback --
+    so the log ends up full of stack traces for the one thing that is
+    working exactly as configured.
+    """
+
+
 class MobileRelayHandshakeReason(enum.IntEnum):
     TOKEN = 1
     BLOCKED = 2
@@ -165,6 +176,8 @@ class MobileRelay(socketserver.BaseRequestHandler):
     limits: RelayLimits
     version: int
     device_id: str
+    probe: bool
+    timed_out: bool
 
     def setup(self) -> None:
         self.users = g_users
@@ -174,6 +187,8 @@ class MobileRelay(socketserver.BaseRequestHandler):
         self.user_new = False
         self.version = PROTOCOL_VERSION
         self.device_id = DEVICE_ID_NONE
+        self.probe = False
+        self.timed_out = False
 
         # Keepalive first, because everything below depends on the kernel
         # being willing to tell us the other end is gone. Without it a
@@ -212,7 +227,14 @@ class MobileRelay(socketserver.BaseRequestHandler):
     def recv_exact(self, size: int) -> bytes:
         data = b""
         while len(data) < size:
-            chunk = self.request.recv(size - len(data))
+            try:
+                chunk = self.request.recv(size - len(data))
+            except socket.timeout:
+                # Out of patience. Report it as a short read, the same shape
+                # every caller here already handles, and remember why so the
+                # log can say "timed out" instead of "login failed".
+                self.timed_out = True
+                break
             if not chunk:
                 break
             data += chunk
@@ -231,6 +253,13 @@ class MobileRelay(socketserver.BaseRequestHandler):
     def recv_handshake(self) -> bool:
         handshake = self.recv_exact(1 + len(handshake_word))
         if len(handshake) != 1 + len(handshake_word):
+            # Nothing at all, then a clean close: that is a port probe, not a
+            # login that failed. REON's own service-status check is one of
+            # these every five minutes, and calling it "Login failed" filled
+            # the journal with a failure that never happened -- which is
+            # exactly the line somebody would be scanning for when a real
+            # login starts failing.
+            self.probe = len(handshake) == 0 and not self.timed_out
             return False
         if handshake[1:] != handshake_word:
             return False
@@ -413,8 +442,8 @@ class MobileRelay(socketserver.BaseRequestHandler):
                 # the server broke. Dropping the connection is what a kick
                 # is, and it is the truthful one: stop waiting, then close.
                 self.user.wait_stop()
-                self.log("Quit: Waited %ds without a call" % self.limits.wait)
-                raise ConnectionResetError
+                raise RelayKicked("Waited %ds without a call"
+                                  % self.limits.wait)
         self.send_wait(MobileRelayWaitResult.ACCEPTED,
                        self.user.get_pair_number())
         self.user.wait_ready()
@@ -489,7 +518,12 @@ class MobileRelay(socketserver.BaseRequestHandler):
         self.log("Connected")
 
         if not self.recv_handshake():
-            self.log("Quit: Login failed")
+            if self.timed_out:
+                self.log("Quit: Silent for %ds" % self.limits.handshake)
+            elif self.probe:
+                self.log("Quit: Port probe")
+            else:
+                self.log("Quit: Login failed")
             return
         self.send_handshake()
         self.log("Logged in as %s" % self.user.get_number(),
@@ -501,12 +535,17 @@ class MobileRelay(socketserver.BaseRequestHandler):
         # so nothing below has to know about timeouts.
         self.request.settimeout(self.limits.idle or None)
 
+        try:
+            self.command_loop()
+        except RelayKicked as reason:
+            self.log("Quit:", reason)
+
+    def command_loop(self) -> None:
         while True:
             try:
                 data = self.request.recv(2)
             except socket.timeout:
-                self.log("Quit: Idle for %ds" % self.limits.idle)
-                return
+                raise RelayKicked("Idle for %ds" % self.limits.idle)
             if len(data) < 2:
                 self.log("Quit: Disconnect")
                 return
