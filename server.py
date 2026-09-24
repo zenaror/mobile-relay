@@ -8,9 +8,203 @@ import select
 import socket
 import configparser
 import socketserver
+import base64
+import json
+import os
+import threading
 
 import users
 import peers
+
+
+class RelayCapture:
+    """Gravar o que passa entre os dois consoles, quando o operador pedir.
+
+    O relay é um cano: cada lado manda bytes, o outro recebe. Ninguém aqui
+    interpreta nada disso, e esta classe também não -- ela guarda o que
+    passou, na ordem em que passou, com a hora de cada pedaço. Interpretar é
+    problema de quem for converter depois (a ideia que motivou isto é virar
+    replay do Pokémon Stadium 2 / Kin Gin), e essa conversão não existe
+    ainda. Gravar cru é o que permite escrevê-la sem precisar de outra
+    partida.
+
+    Desligado por padrão, e isso não é timidez: o arquivo é a partida de
+    DUAS pessoas, não do operador. Ligar é uma decisão de quem administra, e
+    quem ligar deve saber que está guardando conversa de terceiros.
+
+    Um arquivo por conexão, não um por partida. Cada handler do relay só vê
+    UMA direção -- o que o console dele mandou -- porque é ele que lê desse
+    socket. Juntar as duas metades num arquivo só exigiria dois threads
+    escrevendo no mesmo lugar, com trava, para ganhar nada: cada registro
+    leva hora absoluta, então o conversor intercala as duas metades por
+    tempo, depois, sem pressa e sem trava.
+
+    JSON Lines com o dado em base64. Cresce cerca de um terço sobre o
+    binário e vale: uma troca de partida é pequena, e quem for escrever o
+    conversor lê o arquivo com a biblioteca padrão de qualquer linguagem, em
+    vez de descobrir um formato quadro a quadro que eu teria inventado.
+    """
+
+    def __init__(self, filename: str = ""):
+        config = configparser.ConfigParser()
+        if filename:
+            config.read(filename)
+        section = config["capture"] if "capture" in config else {}
+
+        # O arquivo é o padrão; o painel do REON pode ligar por cima, e é
+        # ele que o dono usa ("modo torneio"). Ver active().
+        self.enabled = str(section.get("enabled", "no")).strip().lower() \
+            in ("1", "yes", "true", "on")
+        self.directory = str(section.get("directory", "captures")).strip()
+        # Teto por sessão. Sem ele, um cliente que despeje dados sem parar
+        # enche o disco do servidor -- e o disco cheio derruba o relay para
+        # todo mundo, não só a gravação.
+        try:
+            self.max_bytes = int(section.get("max_bytes", 1 << 20))
+        except (TypeError, ValueError):
+            self.max_bytes = 1 << 20
+        if self.max_bytes < 0:
+            self.max_bytes = 0
+
+    # Ligado AGORA, e não no arranque.
+    #
+    # O interruptor do painel é consultado a cada sessão, de propósito: o
+    # dono liga o modo torneio no site e a próxima partida já grava, sem
+    # reiniciar o relay e sem cortar partida de quem está jogando. Guardar o
+    # valor do arranque seria repetir o erro que deixou o relay-policy dias
+    # recusando correio com uma senha velha na memória.
+    #
+    # O config.ini continua valendo quando não há como perguntar ao painel
+    # (sem banco do REON, sem a tabela, consulta falhando): é o padrão, não
+    # um empate. Ligado no arquivo grava mesmo que o painel diga o contrário
+    # -- quem tem acesso ao arquivo é o operador da máquina.
+    def active(self, users_db=None) -> bool:
+        if self.enabled:
+            return True
+        if users_db is None:
+            return False
+        return users_db.setting(SETTING_CAPTURE) == "1"
+
+    def describe(self) -> str:
+        teto = ("%d bytes" % self.max_bytes) if self.max_bytes else "sem teto"
+        if self.enabled:
+            return "on -> %s (max %s por sessão)" % (self.directory, teto)
+        return ("off no arquivo; o painel pode ligar (%s) -> %s (max %s "
+                "por sessão)" % (SETTING_CAPTURE, self.directory, teto))
+
+
+class CaptureSession:
+    """Um arquivo, uma conexão. Nada aqui pode derrubar o relay.
+
+    Toda falha de disco é engolida depois de uma linha no log: gravar é
+    recurso auxiliar, e uma partida entre duas pessoas não pode acabar
+    porque o diretório de captura ficou cheio ou sem permissão.
+    """
+
+    _lock = threading.Lock()
+
+    def __init__(self, capture: RelayCapture, log, role: str,
+                 my_number: str, pair_number: str, device_id: str,
+                 ligado: bool = False):
+        self._log = log
+        self._file = None
+        self._written = 0
+        self._max = capture.max_bytes
+        self._truncated = False
+        self._start = time.time()
+
+        if not ligado:
+            return
+
+        try:
+            # exist_ok: dois consoles ligando ao mesmo tempo criam o
+            # diretório na mesma fração de segundo.
+            os.makedirs(capture.directory, exist_ok=True)
+            # O nome já diz o par e o papel, para as duas metades de uma
+            # partida serem óbvias numa listagem por ordem alfabética.
+            nome = "%s-%s-%s-%s.jsonl" % (
+                time.strftime("%Y%m%dT%H%M%S", time.gmtime(self._start)),
+                self._sane(my_number), self._sane(pair_number), role)
+            caminho = os.path.join(capture.directory, nome)
+            # O lock é só para não haver duas aberturas do mesmo nome no
+            # mesmo segundo; a escrita em si é de um thread só.
+            with CaptureSession._lock:
+                self._file = open(caminho, "x", encoding="utf-8")
+            self._emit({
+                "type": "start",
+                "time": self._start,
+                "role": role,
+                "number": my_number,
+                "pair_number": pair_number,
+                "device_id": device_id,
+                # Quem for converter precisa saber o que este arquivo NÃO é:
+                # é uma direção só, e o relay não interpretou nada.
+                "note": "one direction only: bytes this console sent. "
+                        "Merge with the peer file by absolute time.",
+            })
+            self._log("Capture: gravando em", caminho)
+        except OSError as e:
+            self._file = None
+            self._log("Capture: indisponível:", e)
+
+    @staticmethod
+    def _sane(value: str) -> str:
+        return "".join(c for c in str(value) if c.isalnum()) or "unknown"
+
+    def _emit(self, obj) -> None:
+        if self._file is None:
+            return
+        try:
+            self._file.write(json.dumps(obj) + "\n")
+            self._file.flush()
+        except OSError as e:
+            self._log("Capture: escrita falhou:", e)
+            self.close("write-error")
+
+    def data(self, payload: bytes) -> None:
+        if self._file is None:
+            return
+
+        # O corte é dito UMA vez, e é dito sempre -- inclusive quando o teto
+        # é atingido exatamente no fim de um pedaço, que é o caso em que a
+        # primeira versão disto cortava calada. Arquivo truncado em silêncio
+        # faria alguém depurar uma partida que nunca terminou.
+        pedaco = payload
+        if self._max:
+            espaco = self._max - self._written
+            if espaco <= 0:
+                self._marcar_truncado()
+                return
+            if len(pedaco) > espaco:
+                pedaco = pedaco[:espaco]
+
+        self._written += len(pedaco)
+        self._emit({"type": "data", "time": time.time(),
+                    "b64": base64.b64encode(pedaco).decode("ascii")})
+
+        if self._max and self._written >= self._max and len(payload) > len(pedaco):
+            self._marcar_truncado()
+
+    def _marcar_truncado(self) -> None:
+        if self._truncated:
+            return
+        self._truncated = True
+        self._emit({"type": "truncated", "time": time.time(),
+                    "limit": self._max})
+        self._log("Capture: teto de %d bytes atingido; o resto desta sessão "
+                  "não foi gravado" % self._max)
+
+    def close(self, reason: str = "end") -> None:
+        if self._file is None:
+            return
+        arquivo, self._file = self._file, None
+        try:
+            arquivo.write(json.dumps({
+                "type": "end", "time": time.time(),
+                "reason": reason, "bytes": self._written}) + "\n")
+            arquivo.close()
+        except OSError:
+            pass
 
 
 class RelayLimits:
@@ -103,6 +297,11 @@ handshake_magic = bytes([PROTOCOL_VERSION]) + handshake_word
 # Device id the relay assumes when a client sends none: REON's row for the
 # account's unnamed device, the same one device-auth uses when `device=`
 # is absent. Blocking that row on the site then reaches these clients too.
+# O interruptor que o painel do REON liga ("modo torneio"), em sys_settings.
+# O nome é o mesmo dos dois lados e não pode divergir: o painel grava por
+# aqui, o relay lê por aqui.
+SETTING_CAPTURE = "relay_capture"
+
 DEVICE_ID_NONE = ""
 DEVICE_ID_SIZE = 8
 
@@ -174,6 +373,8 @@ class MobileRelay(socketserver.BaseRequestHandler):
     users: users.MobileUserDatabase
     peers: peers.MobilePeers
     limits: RelayLimits
+    capture: RelayCapture
+    role: str
     version: int
     device_id: str
     probe: bool
@@ -183,6 +384,10 @@ class MobileRelay(socketserver.BaseRequestHandler):
         self.users = g_users
         self.peers = g_peers
         self.limits = g_limits
+        self.capture = g_capture
+        # Quem ligou e quem esperou. Só serve para nomear a metade de
+        # cada gravação; o relay em si trata os dois lados igual.
+        self.role = "peer"
         self.user = None
         self.user_new = False
         self.version = PROTOCOL_VERSION
@@ -352,6 +557,7 @@ class MobileRelay(socketserver.BaseRequestHandler):
         if number is None:
             return False
         self.log("Command: CALL %s" % number)
+        self.role = "caller"
 
         poller = select.poll()
         poller.register(self.request, select.POLLIN | select.POLLPRI)
@@ -405,6 +611,7 @@ class MobileRelay(socketserver.BaseRequestHandler):
 
     def handle_wait(self) -> bool:
         self.log("Command: WAIT")
+        self.role = "receiver"
 
         poller = select.poll()
         poller.register(self.user.sock, select.POLLIN)
@@ -470,6 +677,19 @@ class MobileRelay(socketserver.BaseRequestHandler):
             raise ConnectionResetError
 
         self.log("Starting relay")
+        # Uma gravação por conexão, com o par identificado no nome. Aberta
+        # aqui e não no handshake: antes disto não há partida, e um arquivo
+        # por scanner que bate na porta não serve a ninguém.
+        # A consulta ao painel vai DENTRO do contexto do banco, como a de
+        # bloqueio de aparelho no handshake: fora dele a conexão nem existe,
+        # e a leitura falharia toda sessão -- caindo no valor do arquivo com
+        # uma linha de erro no log, ou seja, o painel nunca ligaria nada.
+        with self.users:
+            ligado = self.capture.active(self.users)
+        gravacao = CaptureSession(
+            self.capture, self.log, self.role,
+            self.user.get_number(), self.user.get_pair_number(),
+            self.device_id, ligado)
         # TODO: Fork out a process, close sockets in parent
         #       This helps avoid the GIL and would reduce issues
         #        with many simultaneous clients (assuming no directed abuse).
@@ -498,7 +718,11 @@ class MobileRelay(socketserver.BaseRequestHandler):
                         data = mine.recv(1024)
                         if not data:
                             return
+                        # O envio ao par vem PRIMEIRO. Gravar é auxiliar, e
+                        # nada nele deve entrar entre o que um console
+                        # mandou e o que o outro recebe.
                         pair.send(data)
+                        gravacao.data(data)
                     elif fd == pair.fileno() and event & select.POLLRDHUP:
                         return
         except socket.timeout:
@@ -512,6 +736,7 @@ class MobileRelay(socketserver.BaseRequestHandler):
             # We don't care about them at this point.
             pass
         finally:
+            gravacao.close()
             self.log("Quit: Disconnect")
 
     def handle(self) -> None:
@@ -577,7 +802,9 @@ if __name__ == "__main__":
     g_users = users.MobileUserDatabase("config.ini")
     g_peers = peers.MobilePeers(g_users)
     g_limits = RelayLimits("config.ini")
+    g_capture = RelayCapture("config.ini")
     print("Limits:", g_limits.describe())
+    print("Capture:", g_capture.describe())
     with Server((HOST, PORT), MobileRelay) as server:
         try:
             server.serve_forever()

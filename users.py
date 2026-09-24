@@ -171,6 +171,21 @@ class DatabaseMySQL(DatabaseSQLBase):
                 return None
             return bool(row[0])
 
+    # Um interruptor que o painel do REON liga e desliga (sys_settings).
+    # Lido a cada consulta, nunca guardado: o painel tem de fazer efeito sem
+    # reiniciar o relay -- e um valor lido uma vez no arranque foi
+    # exatamente a causa de o relay-policy passar dias recusando correio com
+    # uma senha velha na memória.
+    def lookup_setting(self, name):
+        if not self._reon_db:
+            return None
+        with contextlib.closing(self._db.cursor()) as c:
+            c.execute(self._format("""
+                SELECT value FROM `%s`.sys_settings WHERE name = ?
+            """ % self._reon_db.replace("`", "")), (name,))
+            row = c.fetchone()
+            return None if row is None else str(row[0])
+
 
 class DatabaseSQLite(DatabaseSQLBase):
     def __init__(self, **kwargs):
@@ -275,3 +290,13 @@ class MobileUserDatabase:
         except Exception as e:
             print("Device block lookup failed, letting through:", e)
             return False
+
+    # O valor que o painel gravou, ou None quando não há como saber -- sem
+    # banco do REON, sem a tabela, ou falha na consulta. Quem chama decide o
+    # que fazer com o None, e aqui isso sempre significa "siga o config.ini".
+    def setting(self, name: str) -> typing.Optional[str]:
+        try:
+            return getattr(self._db, "lookup_setting", lambda n: None)(name)
+        except Exception as e:
+            print("Setting lookup failed (%s), using the file:" % name, e)
+            return None
