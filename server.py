@@ -55,7 +55,22 @@ class RelayCapture:
         # ele que o dono usa ("modo torneio"). Ver active().
         self.enabled = str(section.get("enabled", "no")).strip().lower() \
             in ("1", "yes", "true", "on")
-        self.directory = str(section.get("directory", "captures")).strip()
+        # Onde gravar. Três fontes, nesta ordem, e a do meio é a que faz uma
+        # instalação nova funcionar sem ninguém editar nada:
+        #
+        #   1. o config.ini, quando o operador disser explicitamente;
+        #   2. $STATE_DIRECTORY, que o systemd cria e entrega ao usuário do
+        #      serviço quando a unit tem StateDirectory= (é o caso do REON);
+        #   3. "captures", relativo ao diretório atual -- serve para rodar à
+        #      mão, e NÃO serve num serviço: o checkout pertence a outro
+        #      usuário e a gravação falha com Permission denied, aparecendo
+        #      como "modo ligado que não grava nada".
+        #
+        # systemd pode passar vários caminhos separados por ":"; o primeiro é
+        # o nosso.
+        estado = os.environ.get("STATE_DIRECTORY", "").split(":")[0].strip()
+        self.directory = str(
+            section.get("directory") or estado or "captures").strip()
         # Teto por sessão. Sem ele, um cliente que despeje dados sem parar
         # enche o disco do servidor -- e o disco cheio derruba o relay para
         # todo mundo, não só a gravação.
@@ -105,7 +120,7 @@ class CaptureSession:
 
     def __init__(self, capture: RelayCapture, log, role: str,
                  my_number: str, pair_number: str, device_id: str,
-                 ligado: bool = False):
+                 ligado: bool = False, user_id=None):
         self._log = log
         self._file = None
         self._written = 0
@@ -134,9 +149,18 @@ class CaptureSession:
                 "type": "start",
                 "time": self._start,
                 "role": role,
+                # A conta dona deste lado. Vai o ID e não o nome: nome de
+                # conta muda, e quem mostra a lista resolve o ID na hora --
+                # assim a lista nunca mostra um nome que já não existe, e o
+                # arquivo não guarda dado de cadastro que ele não precisa.
+                "user_id": user_id,
                 "number": my_number,
                 "pair_number": pair_number,
                 "device_id": device_id,
+                # Legível, além do "time" acima, para quem abrir o arquivo à
+                # mão saber quando foi sem converter epoch.
+                "started_utc": time.strftime("%Y-%m-%d %H:%M:%S",
+                                             time.gmtime(self._start)),
                 # Quem for converter precisa saber o que este arquivo NÃO é:
                 # é uma direção só, e o relay não interpretou nada.
                 "note": "one direction only: bytes this console sent. "
@@ -375,6 +399,7 @@ class MobileRelay(socketserver.BaseRequestHandler):
     limits: RelayLimits
     capture: RelayCapture
     role: str
+    user_id: typing.Optional[int]
     version: int
     device_id: str
     probe: bool
@@ -388,6 +413,10 @@ class MobileRelay(socketserver.BaseRequestHandler):
         # Quem ligou e quem esperou. Só serve para nomear a metade de
         # cada gravação; o relay em si trata os dois lados igual.
         self.role = "peer"
+        # A conta dona desta conexão, descoberta no handshake. Serve à
+        # gravação: sem ela o arquivo só tem número de telefone do relay,
+        # e quem for procurar a partida de alguém não tem por onde.
+        self.user_id = None
         self.user = None
         self.user_new = False
         self.version = PROTOCOL_VERSION
@@ -511,6 +540,7 @@ class MobileRelay(socketserver.BaseRequestHandler):
                 return self.refuse_handshake(MobileRelayHandshakeReason.TOKEN)
             blocked = self.users.device_blocked(account.user_id,
                                                 self.device_id)
+        self.user_id = account.user_id
 
         # Who is knocking, before the answer: the owner reads this log to
         # see which devices still speak version 0 once the cut is due.
@@ -689,7 +719,7 @@ class MobileRelay(socketserver.BaseRequestHandler):
         gravacao = CaptureSession(
             self.capture, self.log, self.role,
             self.user.get_number(), self.user.get_pair_number(),
-            self.device_id, ligado)
+            self.device_id, ligado, self.user_id)
         # TODO: Fork out a process, close sockets in parent
         #       This helps avoid the GIL and would reduce issues
         #        with many simultaneous clients (assuming no directed abuse).
