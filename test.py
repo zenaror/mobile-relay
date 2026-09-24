@@ -4,17 +4,65 @@ import time
 import typing
 import unittest
 import socket
+import users
 from server import PROTOCOL_VERSION, PROTOCOL_VERSION_DEVICE, \
     handshake_word, handshake_magic, MobileRelayCommand, \
-    MobileRelayCallResult, MobileRelayWaitResult, MobileRelayHandshakeReason
+    MobileRelayCallResult, MobileRelayWaitResult, MobileRelayHandshakeReason, \
+    DEVICE_ID_SIZE
+
+# Duas coisas que existiam quando esta suíte foi escrita e não existem mais.
+# Ela falhava em 5 dos 6 testes por causa delas, e não por defeito no relay:
+#
+#   - a versão 0 do protocolo deixou de ser aceita (ACCEPT_VERSION_0). O que
+#     se fala hoje é a versão 1, a que leva o id do aparelho;
+#   - a negociação de token ao vivo foi aposentada. Um cliente sem token não
+#     ganha mais um: token é provisionado no cadastro e entregue dentro do
+#     mobile_config.bin. Por isso os testes agora CRIAM contas antes de
+#     conectar, pelo mesmo caminho que o cadastro usa (MobileUserDatabase.new).
+#
+# Isso dá à suíte um efeito colateral que ela não tinha: ela escreve no banco
+# do relay. Rode contra um banco de teste -- o config.example.ini traz o
+# [sqlite] justamente para isso -- e não contra o banco que atende gente.
+
+DB: typing.Optional[users.MobileUserDatabase] = None
+CONTADOR = 0
+
+
+def setUpModule() -> None:
+    global DB
+    DB = users.MobileUserDatabase("config.ini")
+
+
+def conta_nova() -> typing.Tuple[users.MobileUser, bytes]:
+    """Uma conta recém-provisionada, com um id de aparelho só dela.
+
+    Uma por cliente, e nunca reaproveitada dentro da execução. Não é
+    desperdício: o relay recusa a MESMA conta conectada duas vezes, e um
+    cliente que fecha leva um instante para o servidor soltar o número dele.
+    Compartilhar conta entre testes faz a suíte falhar conforme a ordem e a
+    velocidade da máquina -- que foi exatamente o que aconteceu aqui antes
+    desta mudança.
+    """
+    global CONTADOR
+    CONTADOR += 1
+    with DB:
+        user = DB.new()
+    assert user is not None, "não consegui criar conta de teste"
+    # Id de aparelho derivado do contador: dois clientes com o mesmo id
+    # seriam o mesmo aparelho para o servidor, e há regras por aparelho
+    # (bloqueio) que não queremos exercitar por acaso.
+    return user, bytes([CONTADOR & 0xFF]) * DEVICE_ID_SIZE
 
 
 class MobileRelayClient:
     sock: typing.Optional[socket.socket]
 
+    # O aparelho tem DEVICE_ID_SIZE bytes, não 16: mandar mais faz o servidor
+    # ler o excedente como se fosse o próximo comando, e a conexão morre com
+    # "Invalid command" logo depois de um login que deu certo.
     def __init__(self, token: typing.Optional[bytes] = None,
-                 version: int = PROTOCOL_VERSION,
-                 device: typing.Optional[bytes] = None,
+                 version: int = PROTOCOL_VERSION_DEVICE,
+                 device: typing.Optional[bytes] = b"\x00" * DEVICE_ID_SIZE,
                  port: int = 31227):
         self.sock = None
         self.token = token
@@ -108,26 +156,55 @@ class MobileRelayClient:
 
 
 class Tests(unittest.TestCase):
-    def test_token(self):
-        c = MobileRelayClient()
+    def cliente(self, **kwargs) -> MobileRelayClient:
+        """Um cliente com conta própria, já conectado."""
+        conta, aparelho = conta_nova()
+        c = MobileRelayClient(token=conta.token, device=aparelho, **kwargs)
+        c.conta = conta
+        return c
+
+    def test_token_provisionado(self):
+        """Quem chega com um token válido entra, e NÃO recebe outro."""
+        c = self.cliente()
         c.send_handshake()
-        token = c.recv_handshake()
-        self.assertIsNot(token, None)
+        # None aqui quer dizer "nenhum token novo", que é o certo: o token
+        # dele já é o que está no cadastro.
+        self.assertIs(c.recv_handshake(), None)
         c.close()
 
-        c = MobileRelayClient(token)
+    def test_token_ausente_recusado(self):
+        """Sem token não se entra mais. A negociação ao vivo foi aposentada."""
+        c = MobileRelayClient(token=None)
         c.send_handshake()
-        token = c.recv_handshake()
-        self.assertIs(token, None)
+        self.assertEqual(c.recv_refusal(), MobileRelayHandshakeReason.TOKEN)
+        c.close()
+
+    def test_token_desconhecido_recusado(self):
+        c = MobileRelayClient(token=b"\xff" * 16)
+        c.send_handshake()
+        self.assertEqual(c.recv_refusal(), MobileRelayHandshakeReason.TOKEN)
+        c.close()
+
+    def test_versao_0_recusada(self):
+        """A versão 0 não é mais falada. O servidor fecha sem dizer por quê.
+
+        Sem reason byte de propósito: quem fala a versão 0 não entende o
+        campo que o explicaria, então o servidor apenas encerra.
+        """
+        conta, _ = conta_nova()
+        c = MobileRelayClient(token=conta.token,
+                              version=PROTOCOL_VERSION, device=None)
+        c.send_handshake()
+        self.assertIs(c.recv_refusal(), None)
         c.close()
 
     def test_conn(self):
-        c1 = MobileRelayClient()
+        c1 = self.cliente()
         c1.send_handshake()
-        self.assertIsNot(c1.recv_handshake(), None)
-        c2 = MobileRelayClient()
+        self.assertIs(c1.recv_handshake(), None)
+        c2 = self.cliente()
         c2.send_handshake()
-        self.assertIsNot(c2.recv_handshake(), None)
+        self.assertIs(c2.recv_handshake(), None)
 
         c1.send_get_number()
         num = c1.recv_get_number()
@@ -145,37 +222,46 @@ class Tests(unittest.TestCase):
         c1.close()
         c2.close()
 
-    def test_disconnect_call(self):
-        c = MobileRelayClient()
+    def test_numero_e_o_da_conta(self):
+        """GET_NUMBER devolve o número provisionado, não um sorteado agora."""
+        c = self.cliente()
         c.send_handshake()
-        self.assertIsNot(c.recv_handshake(), None)
+        c.recv_handshake()
+        c.send_get_number()
+        self.assertEqual(c.recv_get_number(), c.conta.number)
+        c.close()
+
+    def test_disconnect_call(self):
+        c = self.cliente()
+        c.send_handshake()
+        self.assertIs(c.recv_handshake(), None)
         c.send_call("1234")
         time.sleep(0.1)
         c.close()
 
     def test_disconnect_wait(self):
-        c = MobileRelayClient()
+        c = self.cliente()
         c.send_handshake()
-        self.assertIsNot(c.recv_handshake(), None)
+        self.assertIs(c.recv_handshake(), None)
         c.send_wait()
         time.sleep(0.1)
         c.close()
 
     def test_connerr(self):
-        c = MobileRelayClient()
+        c = self.cliente()
         c.send_handshake()
         c.close()
 
     def test_connerr_relay(self):
-        c1 = MobileRelayClient()
+        c1 = self.cliente()
         c1.send_handshake()
-        self.assertIsNot(c1.recv_handshake(), None)
+        self.assertIs(c1.recv_handshake(), None)
         c1.send_get_number()
         num = c1.recv_get_number()
 
-        c2 = MobileRelayClient()
+        c2 = self.cliente()
         c2.send_handshake()
-        self.assertIsNot(c2.recv_handshake(), None)
+        self.assertIs(c2.recv_handshake(), None)
 
         c2.send_call(num)
         c1.send_wait()
