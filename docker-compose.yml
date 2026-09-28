@@ -1,3 +1,5 @@
+# Updated on 2026-09-24. Production runs native, under systemd
+# (reon-mobile-relay.service, Python 3.14 venv); this is a translation of it.
 services:
   mobile-relay:
     build: .
@@ -9,8 +11,37 @@ services:
 
     environment:
       PYTHONUNBUFFERED: "1"
+      # Without this the volume below is pointless, and the failure is silent.
+      # server.py resolves the recording directory in three steps (see the
+      # function around line 62): the config's `directory`, then
+      # $STATE_DIRECTORY, then "captures" relative to the current directory.
+      # In production, systemd sets $STATE_DIRECTORY; a container has no
+      # systemd, so the relay would fall through to the third case and write
+      # to /app/captures -- inside the image layer, lost on the first
+      # restart, with the mounted volume sitting right next to it, empty.
+      STATE_DIRECTORY: /var/lib/reon-captures
 
     volumes:
-      - .:/app
+      # Only the config, and read-only. Before this it was `.:/app`, which
+      # mounted the whole directory over the image: the image's own code was
+      # never used, and `config.ini` with the MySQL password came along with
+      # it. To develop with live reload, uncomment the line below instead of
+      # replacing this one.
+      - ./config.ini:/app/config.ini:ro
+      #- .:/app
 
-    command: python3 server.py
+      # Tournament-mode recordings. Named volume because the content is a
+      # conversation between two consoles that someone will convert into a
+      # replay later -- losing it to a `docker compose down` would mean
+      # losing the match.
+      - relay_captures:/var/lib/reon-captures
+
+    # WARNING about config: in production `[mysql]` points to the database
+    # via `unix_socket`, and a socket does not cross the container boundary.
+    # A Docker install needs `host` and `port` instead -- pointing at the
+    # reon compose's `db` service, if they are on the same network.
+    command: python3 -u server.py
+
+volumes:
+  relay_captures:
+    name: relay_captures
