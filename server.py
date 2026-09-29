@@ -538,8 +538,11 @@ class MobileRelay(socketserver.BaseRequestHandler):
             account = self.users.lookup_token(token)
             if account is None:
                 return self.refuse_handshake(MobileRelayHandshakeReason.TOKEN)
-            blocked = self.users.device_blocked(account.user_id,
-                                                self.device_id)
+            # A banned account is refused like a blocked device (same reason
+            # byte): a ban blocks everything, not just the site.
+            blocked = (self.users.account_banned(account.user_id) or
+                       self.users.device_blocked(account.user_id,
+                                                 self.device_id))
         self.user_id = account.user_id
 
         # Who is knocking, before the answer: the owner reads this log to

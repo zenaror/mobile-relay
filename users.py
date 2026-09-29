@@ -138,6 +138,11 @@ class DatabaseSQLBase(threading.local):
     def lookup_device_blocked(self, user_id, device_id):
         return None
 
+    # Whether REON has banned the account itself. Same rules as above: only
+    # the MySQL backend can answer, and it is read-only.
+    def lookup_account_banned(self, user_id):
+        return None
+
 
 class DatabaseMySQL(DatabaseSQLBase):
     def __init__(self, **kwargs):
@@ -166,6 +171,19 @@ class DatabaseMySQL(DatabaseSQLBase):
                 SELECT blocked FROM `%s`.sys_device_counter
                 WHERE user_id = ? AND device_id = ?
             """ % self._reon_db.replace("`", "")), (user_id, device_id))
+            row = c.fetchone()
+            if row is None:
+                return None
+            return bool(row[0])
+
+    def lookup_account_banned(self, user_id):
+        if not self._reon_db:
+            return None
+        with contextlib.closing(self._db.cursor()) as c:
+            c.execute(self._format("""
+                SELECT banned_at IS NOT NULL FROM `%s`.sys_users
+                WHERE id = ?
+            """ % self._reon_db.replace("`", "")), (user_id,))
             row = c.fetchone()
             if row is None:
                 return None
@@ -289,6 +307,18 @@ class MobileUserDatabase:
             return self._db.lookup_device_blocked(user_id, device_id) is True
         except Exception as e:
             print("Device block lookup failed, letting through:", e)
+            return False
+
+    # True only when REON has that account banned. A ban blocks everything,
+    # the P2P relay included; like the device block, an unknown answer (no REON
+    # database, no such row, a failed lookup) lets the account through.
+    def account_banned(self, user_id: typing.Optional[int]) -> bool:
+        if user_id is None:
+            return False
+        try:
+            return self._db.lookup_account_banned(user_id) is True
+        except Exception as e:
+            print("Account ban lookup failed, letting through:", e)
             return False
 
     # O valor que o painel gravou, ou None quando não há como saber -- sem
